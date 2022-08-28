@@ -1,0 +1,5 @@
+.stack-work/
+*~
+stack.yaml.lock
+input.gml
+output.go

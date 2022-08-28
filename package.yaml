@@ -26,6 +26,8 @@ dependencies:
 - parser-combinators
 - mtl
 - base >= 4.7 && < 5
+- vector
+- containers
 
 ghc-options:
 - -Wall
