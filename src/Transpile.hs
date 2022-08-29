@@ -20,13 +20,19 @@ import qualified Data.Vector as V
 import Data.Map ( Map )
 import qualified Data.Map as M
 
+import Data.Set (Set)
+import qualified Data.Set as S
+
 import Parse (Expr (..), parseExpr)
 import Control.Monad.State (modify)
 import Control.Monad (forM_)
 import Debug.Trace (trace, traceM)
+import Control.Monad (when)
 
 
-data Env = Env { envVars :: Map Text TypeId, envTypes :: Vector TypeInfo }
+
+
+data Env = Env { envVars :: Map Text TypeId, envTypes :: Vector TypeInfo, envSigs :: Set Text }
     deriving Show
 
 
@@ -38,6 +44,8 @@ data TypeInfo = TIUnknown
               | TIFunc [TypeId] TypeId
               | TINumber
     deriving Show
+
+
 
 transpileTI :: TypeInfo -> Trans Text
 transpileTI TIUnknown   = return T.empty
@@ -51,7 +59,7 @@ transpileTI (TIFunc ids ret) = do
     return $ T.concat [ "func(", ids, ") ", ret ]
 
 getType :: TypeId -> Trans TypeInfo
-getType id = gets envTypes >>= \v -> 
+getType id = gets envTypes >>= \v ->
     case (V.!) v id of
         (TIRef id) -> getType id
         e -> return e
@@ -71,6 +79,13 @@ assignName :: TypeId -> Text -> Trans ()
 assignName id n = do
     vars <- gets envVars
     modify $ \s -> s { envVars = M.insert n id vars }
+
+getName :: Text -> Trans TypeId
+getName s = do
+    v <- gets envVars
+    case M.lookup s v of
+        Nothing -> throwError $ T.concat [s, " is undefined!"]
+        Just x -> return x
 
 unify :: TypeId -> TypeId -> Trans ()
 unify at bt = do
@@ -92,7 +107,7 @@ unify at bt = do
         (TIFunc aarg ares, TIFunc barg bres) -> do
             forM_ (zip aarg barg) (uncurry unify)
             unify ares bres
-        
+
         (a', b') -> do
             a' <- transpileTI a'
             b' <- transpileTI b'
@@ -100,88 +115,213 @@ unify at bt = do
 
 --    name, args list, expr
 -- -> function type id, argument type ids, return type id, expr text
-transpileLet :: Text -> [Text] -> Expr -> Trans (TypeId, [TypeId], TypeId, Text)
-transpileLet name args e = do
+inferTypeLet :: Text -> [Text] -> Expr -> Trans (TypeId, [TypeId], TypeId)
+inferTypeLet name args e = do
     argst   <- mapM (\_ -> assignType TIUnknown) args
     returnt <- assignType TIUnknown
     funct   <- assignType $ TIFunc argst returnt
 
     forM_ (zip argst args) (uncurry assignName)
-    -- if no args, then variable is not a function, hence use its return type
-    if null args
-    then assignName returnt name
-    else assignName funct name
+    assignName funct name
 
-    (e, t) <- transpile e
+    t <- inferType e
     -- return type of the function is just return type of the expr
     assocType returnt (TIRef t)
 
-    return (funct, argst, returnt, e)
+    return (funct, argst, returnt)
 
+inferType :: Expr -> Trans TypeId
+inferType (MlNumber n) = assignType TINumber
+inferType (MlSymbol s) = getName s >>= return . TIRef >>= assignType
 
-
-transpile :: Expr -> Trans (Text, TypeId)
-transpile (MlNumber n) = assignType TINumber >>= curry return (T.pack $ show n)
-transpile (MlSymbol s) = do
-    v <- gets envVars
-    case M.lookup s v of
-        Nothing -> throwError $ T.concat [s, " is undefined!"]
-        Just x -> do
-            x <- assignType $ TIRef x
-            return (s, x)
-
-transpile (MlBinary o a b) = do
-    (a, at) <- transpile a
-    (b, bt) <- transpile b
+inferType (MlBinary o a b) = do
+    at <- inferType a
+    bt <- inferType b
     unify at bt
-    return (T.concat [ a, o, b ], at)
+    return at
 
-transpile (MlLetBinding (MlLet name args e) rest) = do
+inferType (MlFunc args e) = do
+    argst   <- mapM (\_ -> assignType TIUnknown) args
+    returnt <- assignType TIUnknown
+    funct   <- assignType $ TIFunc argst returnt
+
+    forM_ (zip argst args) (uncurry assignName)
+
+    t <- inferType e
+    assocType returnt (TIRef t)
+
+    return funct
+
+inferType (MlSignature name args) = do
+    let args' = reverse args
+    argst   <- mapM (assignType . golangToTI) (reverse $ tail args')
+    returnt <-      (assignType . golangToTI) (head args')
+    funct   <- assignType (TIFunc argst returnt)
+
+    assignName funct name
+    ts <- gets envSigs
+    modify $ \s -> s { envSigs = S.insert name ts }
+
+    return funct
+
+
+inferType (MlLetBinding (MlLet name args e) rest) = do
     -- TODO: implement function, arguments
-    (_, _, returnt, e) <- transpileLet name args e
-    (rest, rt) <- transpile rest
-    
-    ret <- getType returnt >>= transpileTI
-    return (T.concat [ "var ", name, " ", ret, " = ", e, "\n", rest ], rt)
+    (_, _, _) <- inferTypeLet name args e
+    rt <- inferType rest
 
-transpile (MlLet name args e) = do
-    (funct, argst, returnt, e) <- transpileLet name args e
-    
-    args' <- mapM getType argst
-             >>= mapM transpileTI
-             >>= return . T.intercalate ", "
-    ret   <- transpileTI =<< getType returnt
+    return rt
 
-    return (T.concat [ "func ", name
-                     , "(", args', ") ", ret, " {\n"
-                     , e
-                     , "}" ], funct)
+inferType (MlLet name args e) = do
+    sigDefined <- gets envSigs >>= return . S.member name
+    if sigDefined
+    then do
+        -- TODO: perhaps check return type too?
+        (TIFunc dargs _) <- getName name >>= getType
+        when (length args /= length dargs)
+             (throwError $ T.concat [ "Wrong argument count in signature of ", name ])
+        getName name
+    else do
+        alreadyDefined <- gets envVars >>= return . M.member name
+        when alreadyDefined (throwError $ T.concat [ "Redefinition of ", name ])
 
-transpile (MlCurried a b) = do
-    (a, at) <- transpile a
+        (_, _, returnt) <- inferTypeLet name args e
+
+        return returnt
+
+
+inferType (MlCurried ma b) = do
+    at <- inferType ma
     at' <- getType at
-    traceM $ show at'
     case at' of
         (TIFunc argst returnt) -> do
-            (b, bt) <- transpile b
-
-            -- TODO: future inferrence of function with unknown parameters
-            --     | this can probably be implemented by splitting up type inference
-            --     | and transpilation
-            -- TODO: check for wrong arguments
-            bt' <- getType bt
+            when (null argst)
+                 (throwError $ T.concat [ T.pack $ show ma, " took too many arguments!" ])
             arg <- getType (head argst)
             case arg of
-                TIUnknown -> assocType (head argst) bt'
+                TIUnknown -> do
+                    bt <- inferType b >>= getType
+                    assocType (head argst) bt
+
+                _ -> return ()
 
             func <- do
                 if length argst == 1
                 then getType returnt
                 else return $ TIFunc (tail argst) returnt -- curry the function!
-            funct <- assignType func
 
-            return (T.concat [ a, "(", b, ")" ], funct)
-        _ -> throwError $ T.concat [ "Cannot curry a non-function: ", a ]
+            assignType func
+
+        _ -> throwError $ T.concat [ "Cannot curry a non-function: ", T.pack $ show ma ]
+
+
+transpileCurry :: Maybe Text -> [(TypeId, Text)] -> TypeId -> Text -> Trans Text
+transpileCurry _    []               returnt ex = return ex
+transpileCurry name ((argt, arg):xs) returnt ex = do
+    argt' <- getType argt >>= transpileTI
+    rett  <- getType returnt >>= transpileTI
+
+    rett  <- curryRet xs rett
+    below <- transpileCurry Nothing xs returnt ex
+    return $ T.concat [ "func", maybe "" (T.cons ' ') name, "(", arg, " ", argt', ")", rett
+                      , "{\nreturn ", below, "\n}"]
+
+    where
+        -- Generates curried function signature
+        -- e.g func(int) func(int) int
+        curryRet [] returnt = return returnt
+        curryRet ((argt, _):xs) returnt = do
+            argt' <- getType argt >>= transpileTI
+
+            below <- curryRet xs returnt
+            return $ T.concat [ "func(", argt', ")", below ]
+
+
+transpile :: Expr -> Trans Text
+transpile (MlNumber n) = return (T.pack $ show n)
+transpile (MlSymbol s) = return s
+
+transpile (MlBinary o a b) = do
+    a <- transpile a
+    b <- transpile b
+
+    return $ T.concat [ a, o, b ]
+
+transpile (MlSignature _ _) = return ""
+
+transpile e@(MlFunc args ex) = do
+    (TIFunc argst returnt) <- inferType e >>= getType
+    ex <- transpile ex
+
+    transpileCurry (zip args argst) returnt ex
+    where
+        -- Generate curried function type
+        -- e.g func(int) func(int) int
+        ret [] r     = r
+        ret (x:xs) r = T.concat [ "func(", x, ") ", ret xs r ]
+
+        -- Generate curried anonymous function
+        transpileCurry :: [(Text, TypeId)] -> TypeId -> Text -> Trans Text
+        transpileCurry [] _ e = return e
+        transpileCurry ((arg, argt):xs) returnt e = do
+            argt'  <- getType argt >>= transpileTI
+            xss    <- mapM (\(_, x) -> transpileTI =<< getType x) xs
+            rcurry <- getType returnt >>= transpileTI >>= return . ret xss
+
+            below <- transpileCurry xs returnt e
+            return $ T.concat [ "func(",  arg, " ", argt', ") ", rcurry
+                              , " {\n return ", below, "}"  ]
+
+
+transpile e@(MlLetBinding (MlLet name _ ex) rest) = do
+    -- TODO: implement function, arguments
+    returnt <- inferType e
+    ex      <- transpile ex
+    rest    <- transpile rest
+
+    ret <- getType returnt >>= transpileTI
+    return $ T.concat [ "var ", name, " ", ret, " = ", ex, "\n", rest ]
+
+transpile (MlLet name args ex) = do
+    (TIFunc argst returnt) <- getName name >>= getType
+
+    ex <- transpile ex
+
+    if null args
+    then return $ T.concat [ "func ", name, "() {\n", ex, "\n}" ]
+    else transpileCurry (Just name) (zip argst args) returnt ex
+
+transpile (MlCurried a b) = do
+    a <- transpile a
+    b <- transpile b
+
+    return $ T.concat [ "(", a, ")(", b, ")" ]
+
+    -- case at' of
+    --     (TIFunc argst returnt) -> do
+    --         (b, bt) <- transpile b
+
+    --         -- TODO: future inferrence of function with unknown parameters
+    --         --     | this can probably be implemented by splitting up type inference
+    --         --     | and transpilation
+    --         -- TODO: check for wrong arguments
+    --         bt' <- getType bt
+    --         arg <- getType (head argst)
+    --         case arg of
+    --             TIUnknown -> assocType (head argst) bt'
+
+    --         -- TODO: i don't like this too much
+    --         -- by transpiling ma again we can hack our way around future inferrence
+    --         traceM $ show (a, at)
+
+    --         func <- do
+    --             if length argst == 1
+    --             then getType returnt
+    --             else return $ TIFunc (tail argst) returnt -- curry the function!
+    --         funct <- assignType func
+
+    --         return (T.concat [ "(", a, ")", "(", b, ")" ], funct)
+    --     _ -> throwError $ T.concat [ "Cannot curry a non-function: ", a ]
 
 
 -- let getTypeOrError (argt, arg) = do
@@ -194,7 +334,8 @@ transpile (MlCurried a b) = do
 
 transpileProgram :: [Expr] -> Trans Text
 transpileProgram es = do
-    es' <- forM es (fmap fst . transpile)
+    forM_ es inferType -- Infer whole tree
+    es' <- forM es (\e -> transpile e >>= \t -> return $ T.concat [t, "\n\n"])
     return $ T.concat ("package main\n\n" : es')
 
 testTranspile :: Text -> IO (Either (Text, Maybe Env) (Text, Env))
@@ -204,7 +345,7 @@ testTranspile s =
         Right es ->
             let t = transpileProgram es
             in do
-                (x, env) <- runStateT (runExceptT t) (Env { envVars = M.empty, envTypes = V.empty })
+                (x, env) <- runStateT (runExceptT t) (Env { envVars = M.empty, envTypes = V.empty, envSigs = S.empty })
                 return $ case x of
                     Left err -> Left (err, Just env)
                     Right ex -> Right (ex, env)

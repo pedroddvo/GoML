@@ -1,4 +1,4 @@
-{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE OverloadedStrings, NamedFieldPuns #-}
 {-# OPTIONS_GHC -Wno-name-shadowing -Wno-unused-imports #-}
 module Parse where
 
@@ -26,12 +26,16 @@ data Expr = MlBinary Text Expr Expr
           | MlLet Text [Text] Expr
           | MlLetBinding Expr Expr
 
+          | MlSignature Text [Text]
+
           | MlFunc [Text] Expr
 
           | MlNumber Integer
           | MlSymbol Text
           | MlNull
           deriving Show
+
+data Program = Program { headers :: [Expr], stmts :: [Expr] }
 
 spaceC :: Parser ()
 spaceC = L.space space1 (L.skipLineComment "--") empty
@@ -48,7 +52,8 @@ keyword t = void $ string t <* (space1 <|> eof)
 keywords :: [Text]
 keywords = [ "let"
            , "in"
-           , "func" ]
+           , "func"
+           , "sig" ]
 
 mlNumber :: Parser Integer
 mlNumber = L.decimal
@@ -86,7 +91,12 @@ mlLetBinding = do
     keyword "in"
     MlLetBinding l <$> expr
 
-
+mlSignature :: Parser Expr
+mlSignature = do
+    keyword "sig"
+    name <- lexeme mlSymbol
+    _    <- symbol ":"
+    MlSignature name <$> sepBy1 (lexeme mlSymbol) (symbol "->")
 
 expr :: Parser Expr
 expr = makeExprParser (curried <|> factor) table
@@ -115,11 +125,17 @@ binary :: Text -> Operator Parser Expr
 binary name = InfixL (MlBinary <$> symbol name)
 
 stmt :: Parser Expr
-stmt = choice [ mlLet ]
+stmt = choice [ mlLet, mlSignature ]
 
 program :: Parser [Expr]
-program = choice [ [] <$ eof
-                 , some stmt <* eof ]
+program = do
+    -- headers <- headers
+    -- stmts   <- choice [ [] <$ eof
+    --                   , some stmt <* eof ]
+    -- return Program { headers, stmts }
+    choice [ [] <$ eof
+           , some stmt <* eof ]
+
 
 parseExpr :: Text -> Either Text [Expr]
 parseExpr s = 
