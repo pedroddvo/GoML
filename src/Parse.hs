@@ -89,8 +89,9 @@ mlLetBinding = do
 
 
 expr :: Parser Expr
-expr = makeExprParser curried table
+expr = makeExprParser (curried <|> factor) table
     where
+        factor = choice [ mlFunc, mlLetBinding ]
         curried = do
             es <- some term
             return $ case es of
@@ -100,8 +101,7 @@ expr = makeExprParser curried table
 term :: Parser Expr
 term = lexeme atom
     where 
-        atom = choice [ mlFunc
-                      , mlLetBinding
+        atom = choice [ symbol "(" *> lexeme expr <* symbol ")"
                       , MlNumber <$> mlNumber
                       , MlSymbol <$> try mlSymbol
                       ]
@@ -119,7 +119,7 @@ stmt = choice [ mlLet ]
 
 program :: Parser [Expr]
 program = choice [ [] <$ eof
-                 , sepBy1 stmt newline ]
+                 , some stmt <* eof ]
 
 parseExpr :: Text -> Either Text [Expr]
 parseExpr s = 

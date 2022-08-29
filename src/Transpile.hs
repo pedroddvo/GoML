@@ -29,6 +29,7 @@ import Debug.Trace (trace, traceM)
 data Env = Env { envVars :: Map Text TypeId, envTypes :: Vector TypeInfo }
     deriving Show
 
+
 type Trans = ExceptT Text (StateT Env IO)
 
 type TypeId = Int
@@ -50,7 +51,10 @@ transpileTI (TIFunc ids ret) = do
     return $ T.concat [ "func(", ids, ") ", ret ]
 
 getType :: TypeId -> Trans TypeInfo
-getType id = gets envTypes >>= \v -> return $ (V.!) v id
+getType id = gets envTypes >>= \v -> 
+    case (V.!) v id of
+        (TIRef id) -> getType id
+        e -> return e
 
 assignType :: TypeInfo -> Trans TypeId
 assignType t = do
@@ -78,6 +82,8 @@ unify at bt = do
         (_, TIRef bt) -> unify at bt
 
         (TINumber, TINumber) -> return ()
+
+        (TIUnknown, TIUnknown) -> return ()
 
         -- Assume that they match
         (TIUnknown, _) -> assocType at (TIRef bt)
@@ -119,7 +125,7 @@ transpile (MlNumber n) = assignType TINumber >>= curry return (T.pack $ show n)
 transpile (MlSymbol s) = do
     v <- gets envVars
     case M.lookup s v of
-        Nothing -> throwError $ T.concat [s, "is undefined!"]
+        Nothing -> throwError $ T.concat [s, " is undefined!"]
         Just x -> do
             x <- assignType $ TIRef x
             return (s, x)
@@ -136,19 +142,12 @@ transpile (MlLetBinding (MlLet name args e) rest) = do
     (rest, rt) <- transpile rest
     
     ret <- getType returnt >>= transpileTI
-    return (T.concat ["var ", name, " ", ret, " = ", e, "\n", rest ], rt)
+    return (T.concat [ "var ", name, " ", ret, " = ", e, "\n", rest ], rt)
 
 transpile (MlLet name args e) = do
     (funct, argst, returnt, e) <- transpileLet name args e
-
-    let getTypeOrError (argt, arg) = do
-        t <- getType argt
-        case t of
-            TIUnknown ->
-                throwError $ T.concat [ "Type of ", arg, " could not be resolved in function ", name, "!" ]
-            t' -> return t'
     
-    args' <- mapM getTypeOrError (zip argst args)
+    args' <- mapM getType argst
              >>= mapM transpileTI
              >>= return . T.intercalate ", "
     ret   <- transpileTI =<< getType returnt
@@ -158,7 +157,39 @@ transpile (MlLet name args e) = do
                      , e
                      , "}" ], funct)
 
+transpile (MlCurried a b) = do
+    (a, at) <- transpile a
+    at' <- getType at
+    traceM $ show at'
+    case at' of
+        (TIFunc argst returnt) -> do
+            (b, bt) <- transpile b
 
+            -- TODO: future inferrence of function with unknown parameters
+            --     | this can probably be implemented by splitting up type inference
+            --     | and transpilation
+            -- TODO: check for wrong arguments
+            bt' <- getType bt
+            arg <- getType (head argst)
+            case arg of
+                TIUnknown -> assocType (head argst) bt'
+
+            func <- do
+                if length argst == 1
+                then getType returnt
+                else return $ TIFunc (tail argst) returnt -- curry the function!
+            funct <- assignType func
+
+            return (T.concat [ a, "(", b, ")" ], funct)
+        _ -> throwError $ T.concat [ "Cannot curry a non-function: ", a ]
+
+
+-- let getTypeOrError (argt, arg) = do
+--     t <- getType argt
+--     case t of
+--         TIUnknown ->
+--             throwError $ T.concat [ "Type of ", arg, " could not be resolved in function ", name, "!" ]
+--         t' -> return t'
 
 
 transpileProgram :: [Expr] -> Trans Text
